@@ -1,0 +1,41 @@
+{
+  "name": "dohrnii-token",
+  "version": "1.0.0",
+  "description": "DHN — Dohrnii ERC-20 token (UUPS upgradeable, ERC-7201 namespaced storage)",
+  "main": "index.js",
+  "scripts": {
+    "test": "hardhat test mocha",
+    "build": "hardhat build",
+    "compile": "hardhat build",
+    "coverage": "hardhat test mocha --coverage",
+    "lint": "solhint 'contracts/**/*.sol' --max-warnings 0",
+    "clean": "hardhat clean",
+    "typecheck": "tsc --noEmit",
+    "slither": "slither contracts/DohrniiToken.sol --fail-on medium",
+    "deploy": "hardhat run scripts/deploy.ts",
+    "upgrade": "hardhat run scripts/upgrade.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "private": "true",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^4.0.15",
+    "@nomicfoundation/hardhat-mocha": "^3.1.0",
+    "@nomicfoundation/hardhat-network-helpers": "^3.0.11",
+    "@nomicfoundation/hardhat-toolbox-mocha-ethers": "^3.0.7",
+    "@nomicfoundation/hardhat-verify": "^3.0.22",
+    "@openzeppelin/contracts": "^5.6.1",
+    "@openzeppelin/contracts-upgradeable": "^5.6.1",
+    "@openzeppelin/hardhat-upgrades": "^4.1.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.1.2",
+    "chai": "^5.3.3",
+    "dotenv": "^17.4.2",
+    "ethers": "^6.17.0",
+    "hardhat": "^3.12.0",
+    "solhint": "^6.2.3",
+    "typescript": "^7.0.2"
+  }
+}
