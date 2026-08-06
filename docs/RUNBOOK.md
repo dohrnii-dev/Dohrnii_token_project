@@ -16,6 +16,7 @@ implementation has no state and its `initialize` is permanently disabled.
 | `cancelDefaultAdminTransfer()` | `DEFAULT_ADMIN_ROLE` | aborts it |
 | `acceptDefaultAdminTransfer()` | pending owner, after the delay | completes it |
 | `changeDefaultAdminDelay(uint48)` | `DEFAULT_ADMIN_ROLE` | changes the delay (itself delayed) |
+| `rollbackDefaultAdminDelay()` | `DEFAULT_ADMIN_ROLE` | cancels a delay change that has not taken effect yet |
 | `upgradeToAndCall(impl, data)` | `UPGRADER_ROLE` | points the proxy at new code |
 
 There is **no** mint, burn, pause or token-rescue function. Supply is fixed at 372,000,000 DHN.
@@ -104,13 +105,18 @@ address at once.
 ## Transferring ownership
 
 1. Current owner: `beginDefaultAdminTransfer(0xNew…)`
-2. Wait out `defaultAdminDelay()` (3 days by default). `pendingDefaultAdmin()` shows the nominee and
-   the earliest acceptance timestamp.
+2. Wait out `defaultAdminDelay()` (3 hours if deployed with the default). `pendingDefaultAdmin()`
+   shows the nominee and the earliest acceptance timestamp. Accepting before that timestamp reverts
+   with `AccessControlEnforcedDefaultAdminDelay`.
 3. **The new owner** calls `acceptDefaultAdminTransfer()` from its own wallet.
 
-Until step 3 the old owner keeps admin, and `cancelDefaultAdminTransfer()` aborts. The transfer only
-moves `DEFAULT_ADMIN_ROLE`; the operational roles the old owner holds must be revoked and re-granted
-separately by the new admin.
+Until step 3 the old owner keeps admin, and `cancelDefaultAdminTransfer()` aborts — with no time
+limit, so it works during the delay *and* after it, right up until the nominee accepts. The transfer
+only moves `DEFAULT_ADMIN_ROLE`; the operational roles the old owner holds must be revoked and
+re-granted separately by the new admin.
+
+Nothing happens automatically when the delay expires: the nominee must send
+`acceptDefaultAdminTransfer()` itself, and until it does, ownership stays where it is indefinitely.
 
 Verify the nominee can sign before starting: an address that never accepts leaves ownership where it
 is, but an accepted transfer to an unreachable wallet is unrecoverable.

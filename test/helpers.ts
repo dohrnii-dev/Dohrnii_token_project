@@ -19,5 +19,5 @@ export async function connect() {
 /** 372,000,000 DHN in wei. */
 export const TOTAL_SUPPLY = 372_000_000n * 10n ** 18n;
 
-/** Delay used for the default-admin (owner) two-step transfer in tests. */
-export const ADMIN_DELAY = 3n * 24n * 60n * 60n; // 3 days
+/** Delay used for the default-admin (owner) two-step transfer in tests. Matches the deploy default. */
+export const ADMIN_DELAY = 3n * 60n * 60n; // 3 hours

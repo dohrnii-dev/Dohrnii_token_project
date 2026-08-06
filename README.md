@@ -15,12 +15,25 @@ without a storage-layout migration on the live token.
 | Storage | ERC-7201 namespace `dohrnii.storage.DohrniiToken` |
 | Solidity | 0.8.36, optimizer on (200 runs) |
 
+## Design assumptions
+
+Two properties of this token are deliberate architecture, agreed at kickoff and specified in
+writing: **the address blacklist** and **UUPS upgradeability**. Neither is a defect, and a review
+should treat them as the design's trust assumptions rather than as findings to be closed.
+
+Stated plainly, so nothing is hidden: the owner wallet can freeze any address, and can replace the
+contract's code entirely — including with code that adds powers this build deliberately lacks, such
+as minting or seizing. The token's security therefore rests on the custody of that wallet, not on
+the absence of those powers, and that is where review effort belongs — key custody, multisig
+thresholds, and the operator procedures in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+Everything outside those two decisions — fixed supply, access control, storage layout, transfer
+logic — is meant to hold on its own merits. A finding there is a real finding.
+
 ## Contracts
 
 - [contracts/DohrniiToken.sol](contracts/DohrniiToken.sol) — the token. The only production contract.
-- [contracts/mocks/DohrniiTokenV2Mock.sol](contracts/mocks/DohrniiTokenV2Mock.sol) — **test only.**
-  A sample V2 that adds a pause feature in its own ERC-7201 namespace, so the upgrade tests prove
-  the deferred-feature path on a live proxy.
+
 
 ## Feature set
 
@@ -45,6 +58,39 @@ Approvals are never blocked; only balance movements are, so a blacklisted holder
 `setBlacklistEnabled(false)` to stop all enforcement without clearing the list, and switch it back
 on later. It is on at launch.
 
+#### Freezing immobilises; it never confiscates
+
+This is a deliberate property of the design, not an omission. Blacklisting an address stops its
+balance from moving; it does not move, take or destroy that balance. There is no mint, no burn, no
+seize and no token-rescue function anywhere in this build, and no role can reach one — which is the
+point: a holder reading the contract on Etherscan can see that no admin power exists to take their
+tokens or dilute them. The trade-off, accepted knowingly, is that the same guarantee applies to
+tokens you might *want* to recover.
+
+Three consequences follow, and they are worth stating plainly before launch:
+
+- **Freezing is containment, not recovery.** Blacklisting an address holding stolen DHN stops the
+  thief spending or bridging it, and stops any exchange crediting a deposit from it. It does not
+  return the tokens to you. Recovery, if it ever happens, is an off-chain matter — a negotiation, or
+  law enforcement — and blacklisting is what buys the time for it.
+- **Frozen balances still count towards `totalSupply()`.** Supply is fixed at 372,000,000 DHN
+  forever, whatever is frozen. Circulating supply is therefore an off-chain calculation: take
+  `totalSupply()` and subtract the balances of the treasury, unissued-reward and frozen addresses.
+  Anything reporting `totalSupply()` as circulating supply — an explorer, a market-data feed, a
+  listing form — will overstate it. Publish the frozen addresses you rely on so the figure can be
+  reproduced.
+- **The freeze itself is fully reversible.** `setBlacklisted(addr, false)` restores the address
+  completely, with its balance and any approvals it signed earlier intact, and
+  `setBlacklistEnabled(false)` lifts every freeze at once. Nothing about a freeze decays or expires
+  on its own, so an address stays frozen until someone with `BLACKLIST_MANAGER_ROLE` clears it. Keep
+  a record of why each address was listed; the contract stores only the flag, and the
+  `BlacklistUpdated` event log is the only history there is.
+
+Adding a burn, a claw-back or a rescue function would each mean a new implementation, a fresh audit
+and an upgrade — see the deferred-feature rules under [Upgrades](#upgrades). Each one also removes a
+guarantee holders currently have, so it is a decision to take on its merits rather than a gap to
+fill.
+
 ### Roles
 
 | Role | Powers |
@@ -57,11 +103,25 @@ on later. It is on at launch.
 `initialize` grants all four to the owner wallet, so the single wallet you control operates the
 token out of the box and can delegate any individual power later without giving up ownership.
 
-Ownership itself moves in two steps with a delay (`AccessControlDefaultAdminRules`): the current
-owner calls `beginDefaultAdminTransfer`, and after `defaultAdminDelay()` the nominee calls
-`acceptDefaultAdminTransfer`. `grantRole(DEFAULT_ADMIN_ROLE, …)` is rejected outright, so ownership
-can never be handed to a wrong or unreachable address in one transaction — the Ownable2Step
-guarantee, with granular roles on top.
+Ownership itself moves in two steps (`AccessControlDefaultAdminRules`): the current owner calls
+`beginDefaultAdminTransfer`, and the nominee calls `acceptDefaultAdminTransfer` from its own wallet.
+`grantRole(DEFAULT_ADMIN_ROLE, …)` is rejected outright, so ownership can never be handed to a wrong
+or unreachable address in a single transaction — the Ownable2Step guarantee, with granular roles on
+top.
+
+Two things are worth stating precisely, because they depend on configuration rather than on the
+contract:
+
+- **The cancellation window is exactly `defaultAdminDelay()`, whatever was set at deployment.** For
+  its duration `acceptDefaultAdminTransfer` reverts and the current owner can call
+  `cancelDefaultAdminTransfer`. With a delay of `0` there is no window at all: the nominee can
+  accept in the next block, and only the explicit-acceptance guarantee remains. A non-zero delay is
+  what buys time to react to a wrong or compromised nominee — pick it deliberately.
+- **`_initialAdminDelay` is capped at `MAX_ADMIN_DELAY` (7 days).** Reducing a delay later costs
+  exactly the amount removed, so an over-long initial value would lock ownership rotation for that
+  whole period with no way to shorten it; `259200000` (milliseconds by mistake) would mean 8 years.
+  Values above the cap are rejected with `DohrniiAdminDelayTooLong`. `0` is accepted — see above for
+  what it costs.
 
 ### ERC-7201 storage
 

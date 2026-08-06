@@ -10,7 +10,7 @@ coverage.json
 requirements.md
 
 # OpenZeppelin upgrades manifests: keep the real networks, drop ephemeral ones
-.openzeppelin/unknown-*.json
+.openzeppelin/
 
 # env / secrets
 .env

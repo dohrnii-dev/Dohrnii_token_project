@@ -110,6 +110,69 @@ describe("DohrniiToken", () => {
     });
   });
 
+  describe("initial admin delay bounds", () => {
+    const CAP = 7n * 24n * 60n * 60n; // MAX_ADMIN_DELAY
+
+    /** Deploys a fresh proxy with an arbitrary initial admin delay. */
+    async function deployWithDelay(delay: bigint) {
+      const { ethers, upgrades } = await connect();
+      const [, owner, treasury] = await ethers.getSigners();
+      const Factory = await ethers.getContractFactory("DohrniiToken");
+      const deploy = () =>
+        upgrades.deployProxy(Factory, [owner.address, treasury.address, delay], { kind: "uups" });
+      return { ethers, Factory, owner, deploy };
+    }
+
+    it("caps the initial delay at one week", async () => {
+      const { token } = await fixture();
+      expect(await token.MAX_ADMIN_DELAY()).to.equal(CAP);
+    });
+
+    it("accepts a delay exactly at the cap", async () => {
+      const { deploy } = await deployWithDelay(CAP);
+      const token = await deploy();
+      expect(await token.defaultAdminDelay()).to.equal(CAP);
+    });
+
+    it("rejects a delay one second above the cap", async () => {
+      const { Factory, deploy } = await deployWithDelay(CAP + 1n);
+      await expect(deploy())
+        .to.be.revertedWithCustomError(Factory, "DohrniiAdminDelayTooLong")
+        .withArgs(CAP + 1n, CAP);
+    });
+
+    it("rejects type(uint48).max, which would overflow the transfer schedule", async () => {
+      const maxUint48 = 2n ** 48n - 1n;
+      const { Factory, deploy } = await deployWithDelay(maxUint48);
+      await expect(deploy())
+        .to.be.revertedWithCustomError(Factory, "DohrniiAdminDelayTooLong")
+        .withArgs(maxUint48, CAP);
+    });
+
+    it("rejects milliseconds passed where seconds were meant", async () => {
+      // 3 days in milliseconds. Unbounded, this would freeze ownership rotation for ~8 years.
+      const msTypo = 259_200_000n;
+      const { Factory, deploy } = await deployWithDelay(msTypo);
+      await expect(deploy())
+        .to.be.revertedWithCustomError(Factory, "DohrniiAdminDelayTooLong")
+        .withArgs(msTypo, CAP);
+    });
+
+    it("still accepts zero, which removes the cancellation window entirely", async () => {
+      const { ethers, owner, deploy } = await deployWithDelay(0n);
+      const { networkHelpers } = await connect();
+      const [, , , alice] = await ethers.getSigners();
+      const token = await deploy();
+      expect(await token.defaultAdminDelay()).to.equal(0n);
+
+      // Documented consequence: the nominee can take ownership in the very next block.
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await networkHelpers.time.increase(1);
+      await token.connect(alice).acceptDefaultAdminTransfer();
+      expect(await token.owner()).to.equal(alice.address);
+    });
+  });
+
   describe("ERC-20 behaviour", () => {
     it("transfers between holders", async () => {
       const { ethers, token, alice, bob } = await fixture();
@@ -315,6 +378,83 @@ describe("DohrniiToken", () => {
       await token.connect(owner).cancelDefaultAdminTransfer();
       const [pendingAdmin] = await token.pendingDefaultAdmin();
       expect(pendingAdmin).to.equal(ethers.ZeroAddress);
+    });
+
+    it("gives the owner a unilateral veto for the whole window", async () => {
+      const { token, owner, alice, bob } = await fixture();
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+
+      // Inside the window the nominee cannot outrun a cancellation...
+      await expect(
+        token.connect(alice).acceptDefaultAdminTransfer(),
+      ).to.be.revertedWithCustomError(token, "AccessControlEnforcedDefaultAdminDelay");
+      // ...and nobody else can accept on its behalf.
+      await expect(token.connect(bob).acceptDefaultAdminTransfer())
+        .to.be.revertedWithCustomError(token, "AccessControlInvalidDefaultAdmin")
+        .withArgs(bob.address);
+
+      expect(await token.owner()).to.equal(owner.address);
+    });
+
+    it("lets the owner cancel even after the window has elapsed", async () => {
+      const { ethers, token, owner, alice } = await fixture();
+      const { networkHelpers } = await connect();
+
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await networkHelpers.time.increase(ADMIN_DELAY + 1n);
+
+      // cancelDefaultAdminTransfer carries no deadline: past the window it is a race, not a right.
+      await token.connect(owner).cancelDefaultAdminTransfer();
+      await expect(token.connect(alice).acceptDefaultAdminTransfer())
+        .to.be.revertedWithCustomError(token, "AccessControlInvalidDefaultAdmin")
+        .withArgs(alice.address);
+      expect(await token.owner()).to.equal(owner.address);
+      const [pendingAdmin] = await token.pendingDefaultAdmin();
+      expect(pendingAdmin).to.equal(ethers.ZeroAddress);
+    });
+
+    it("never moves ownership on its own once the window expires", async () => {
+      const { token, owner, alice } = await fixture();
+      const { networkHelpers } = await connect();
+
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await networkHelpers.time.increase(ADMIN_DELAY * 100n);
+
+      // Expiry only lifts the ban on accepting; the nominee must still send the transaction.
+      expect(await token.owner()).to.equal(owner.address);
+      expect(await token.hasRole(await token.DEFAULT_ADMIN_ROLE(), owner.address)).to.equal(true);
+      expect(await token.hasRole(await token.DEFAULT_ADMIN_ROLE(), alice.address)).to.equal(false);
+      const [pendingAdmin] = await token.pendingDefaultAdmin();
+      expect(pendingAdmin).to.equal(alice.address);
+    });
+
+    it("re-nominating replaces the candidate and restarts the window", async () => {
+      const { token, owner, alice, bob } = await fixture();
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await token.connect(owner).beginDefaultAdminTransfer(bob.address);
+
+      const [pendingAdmin] = await token.pendingDefaultAdmin();
+      expect(pendingAdmin).to.equal(bob.address);
+      await expect(token.connect(alice).acceptDefaultAdminTransfer())
+        .to.be.revertedWithCustomError(token, "AccessControlInvalidDefaultAdmin")
+        .withArgs(alice.address);
+    });
+
+    it("leaves post-deployment delay changes to OpenZeppelin's own guard", async () => {
+      const { token, owner } = await fixture();
+
+      // Deliberately not capped: unlike the initial value, a change waits before taking effect
+      // and can be undone in that window, so a fat-fingered value here is recoverable.
+      const overLong = 10n ** 12n;
+      await token.connect(owner).changeDefaultAdminDelay(overLong);
+      expect(await token.defaultAdminDelay()).to.equal(ADMIN_DELAY);
+      const [pendingDelay] = await token.pendingDefaultAdminDelay();
+      expect(pendingDelay).to.equal(overLong);
+
+      await token.connect(owner).rollbackDefaultAdminDelay();
+      const [afterRollback] = await token.pendingDefaultAdminDelay();
+      expect(afterRollback).to.equal(0n);
+      expect(await token.defaultAdminDelay()).to.equal(ADMIN_DELAY);
     });
   });
 

@@ -41,6 +41,19 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
     /// @notice Can upgrade the implementation behind the proxy.
     bytes32 public constant UPGRADER_ROLE = keccak256("DHN_UPGRADER_ROLE");
 
+    /**
+     * @notice Upper bound on the ownership-transfer delay accepted at initialisation.
+     * @dev Lowering the delay later costs exactly the amount being removed, so an over-long initial
+     *      value is self-locking: ownership can then neither be rotated nor the delay repaired. A
+     *      week keeps every value reachable within a week, and puts a fat-fingered `259200000`
+     *      (milliseconds instead of seconds) out of range rather than freezing ownership rotation
+     *      for 8 years. Later changes need no such bound: they wait
+     *      `defaultAdminDelayIncreaseWait()` before taking effect and can be undone in that window
+     *      with `rollbackDefaultAdminDelay`, while the value passed here applies immediately and
+     *      irreversibly.
+     */
+    uint48 public constant MAX_ADMIN_DELAY = 7 days;
+
     // -------------------------------------------------------------------------
     // ERC-7201 namespaced storage
     // -------------------------------------------------------------------------
@@ -91,6 +104,9 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
     /// @dev The zero address is not a valid argument here.
     error DohrniiZeroAddress();
 
+    /// @dev The requested ownership-transfer delay exceeds {MAX_ADMIN_DELAY}.
+    error DohrniiAdminDelayTooLong(uint48 delay, uint48 maxDelay);
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------
@@ -106,10 +122,12 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
      *        blacklist, feature and upgrader roles so it can operate the token unaided or
      *        delegate any of them later.
      * @param _supplyRecipient Wallet that receives the entire {TOTAL_SUPPLY}.
-     * @param _initialAdminDelay Delay enforced on a later transfer of the default admin role.
+     * @param _initialAdminDelay Delay enforced on a later transfer of the default admin role, in
+     *        seconds. Must not exceed {MAX_ADMIN_DELAY}.
      */
     function initialize(address _owner, address _supplyRecipient, uint48 _initialAdminDelay) external initializer {
         if (_owner == address(0) || _supplyRecipient == address(0)) revert DohrniiZeroAddress();
+        _checkAdminDelay(_initialAdminDelay);
 
         __ERC20_init("Dohrnii", "DHN");
         __AccessControlDefaultAdminRules_init(_initialAdminDelay, _owner);
@@ -200,6 +218,11 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         }
 
         super._update(from, to, value);
+    }
+
+    /// @dev Rejects an ownership-transfer delay that could not be undone in reasonable time.
+    function _checkAdminDelay(uint48 delay) private pure {
+        if (delay > MAX_ADMIN_DELAY) revert DohrniiAdminDelayTooLong(delay, MAX_ADMIN_DELAY);
     }
 
     function _setBlacklisted(address account, bool blacklisted) private {

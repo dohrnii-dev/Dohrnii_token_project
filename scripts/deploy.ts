@@ -6,7 +6,10 @@
  * Required environment / configuration variables:
  *   OWNER_ADDRESS             wallet that becomes default admin (`owner()`) and holds every role
  *   SUPPLY_RECIPIENT_ADDRESS  wallet that receives the full 372,000,000 DHN (defaults to OWNER_ADDRESS)
- *   ADMIN_DELAY_SECONDS       delay on a later ownership transfer (default 259200 = 3 days)
+ *   ADMIN_DELAY_SECONDS       delay on a later ownership transfer (default 10800 = 3 hours)
+ *
+ * The proxy and its implementation are verified on Etherscan at the end of the run. Set
+ * SKIP_VERIFY=true to skip that step, or VERIFY_CONFIRMATIONS to change how long it waits first.
  *
  * The deployer wallet pays gas and holds no privileges afterwards: `initialize` assigns every
  * role to OWNER_ADDRESS, so no handover transaction is needed.
@@ -15,7 +18,9 @@ import hre from "hardhat";
 import { upgrades as upgradesFactory } from "@openzeppelin/hardhat-upgrades";
 import { isAddress } from "ethers";
 
-const DEFAULT_ADMIN_DELAY_SECONDS = 3n * 24n * 60n * 60n;
+import { verifyDeployment } from "./verify.js";
+
+const DEFAULT_ADMIN_DELAY_SECONDS = 3n * 60n * 60n; // 3 hours
 
 function requireAddress(name: string, value: string | undefined): string {
   if (value === undefined || !isAddress(value)) {
@@ -59,9 +64,9 @@ async function main() {
   console.log(`implementation:   ${implementationAddress}`);
   console.log(`total supply:     ${ethers.formatEther(await token.totalSupply())} DHN`);
   console.log(`owner() reports:  ${await token.owner()}`);
-  console.log("");
-  console.log("Verify with:");
-  console.log(`  npx hardhat verify --network <network> ${proxyAddress}`);
+
+  const { chainId } = await ethers.provider.getNetwork();
+  await verifyDeployment(hre, chainId, proxyAddress, token.deploymentTransaction());
 }
 
 main().catch((error) => {

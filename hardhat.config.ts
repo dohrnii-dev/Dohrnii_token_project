@@ -1,3 +1,9 @@
+// Hardhat 3 does not read .env by itself, and this config is loaded before any script runs, so
+// loading it here populates process.env for both `configVariable(...)` below and scripts/*.ts.
+import dotenv from "dotenv";
+
+dotenv.config({ quiet: true });
+
 import type { HardhatUserConfig } from "hardhat/config";
 import { configVariable } from "hardhat/config";
 
@@ -7,6 +13,9 @@ import hardhatUpgrades from "@openzeppelin/hardhat-upgrades";
 const config: HardhatUserConfig = {
   plugins: [hardhatToolboxMochaEthers, hardhatUpgrades],
 
+  // The two profiles must stay byte-for-byte identical: `run` and `test` build with `default`,
+  // while `verify` always builds with `production`. Any difference (optimizer runs, evmVersion,
+  // metadata) makes verification fail with a bytecode mismatch on an otherwise correct deployment.
   solidity: {
     profiles: {
       default: {
@@ -21,7 +30,6 @@ const config: HardhatUserConfig = {
         settings: {
           optimizer: { enabled: true, runs: 200 },
           evmVersion: "cancun",
-          metadata: { bytecodeHash: "none" },
         },
       },
     },
@@ -65,6 +73,9 @@ const config: HardhatUserConfig = {
     etherscan: {
       apiKey: configVariable("ETHERSCAN_API_KEY"),
     },
+    // Etherscan is the deliverable; flip either of these to `true` to publish sources there too.
+    blockscout: { enabled: false },
+    sourcify: { enabled: false },
   },
 };
 
