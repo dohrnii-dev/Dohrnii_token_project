@@ -42,15 +42,18 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
     bytes32 public constant UPGRADER_ROLE = keccak256("DHN_UPGRADER_ROLE");
 
     /**
-     * @notice Upper bound on the ownership-transfer delay accepted at initialisation.
-     * @dev Lowering the delay later costs exactly the amount being removed, so an over-long initial
-     *      value is self-locking: ownership can then neither be rotated nor the delay repaired. A
-     *      week keeps every value reachable within a week, and puts a fat-fingered `259200000`
-     *      (milliseconds instead of seconds) out of range rather than freezing ownership rotation
-     *      for 8 years. Later changes need no such bound: they wait
-     *      `defaultAdminDelayIncreaseWait()` before taking effect and can be undone in that window
-     *      with `rollbackDefaultAdminDelay`, while the value passed here applies immediately and
-     *      irreversibly.
+     * @notice Upper bound on the ownership-transfer delay, enforced at initialisation and on every
+     *         later change through {changeDefaultAdminDelay}.
+     * @dev Lowering the delay costs exactly the amount being removed, so an over-long value is
+     *      self-locking: ownership can then neither be rotated nor the delay repaired for as long
+     *      as it takes to unwind. A week keeps every value reachable within a week, and puts a
+     *      fat-fingered `259200000` (milliseconds instead of seconds) out of range rather than
+     *      freezing ownership rotation for 8 years.
+     *
+     *      An increase scheduled through {changeDefaultAdminDelay} only waits
+     *      `defaultAdminDelayIncreaseWait()` (5 days) before taking effect and can be undone in
+     *      that window with `rollbackDefaultAdminDelay`, but once it has taken effect it is as
+     *      binding as the initial value — hence the same cap applies to both.
      */
     uint48 public constant MAX_ADMIN_DELAY = 7 days;
 
@@ -123,7 +126,8 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
      *        delegate any of them later.
      * @param _supplyRecipient Wallet that receives the entire {TOTAL_SUPPLY}.
      * @param _initialAdminDelay Delay enforced on a later transfer of the default admin role, in
-     *        seconds. Must not exceed {MAX_ADMIN_DELAY}.
+     *        seconds. Must not exceed {MAX_ADMIN_DELAY}, as must any later change through
+     *        {changeDefaultAdminDelay}.
      */
     function initialize(address _owner, address _supplyRecipient, uint48 _initialAdminDelay) external initializer {
         if (_owner == address(0) || _supplyRecipient == address(0)) revert DohrniiZeroAddress();
@@ -190,6 +194,21 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         for (uint256 i = 0; i < accounts.length; ++i) {
             _setBlacklisted(accounts[i], blacklisted);
         }
+    }
+
+    /**
+     * @notice Schedules a new ownership-transfer delay, capped at {MAX_ADMIN_DELAY}.
+     * @dev Adds the {MAX_ADMIN_DELAY} bound the base contract does not apply. Without it the
+     *      default admin could schedule an arbitrarily large delay, which becomes effective after
+     *      at most `defaultAdminDelayIncreaseWait()` and then takes roughly its own length to
+     *      unwind, locking admin rotation for months or years. Everything else — who may call,
+     *      when the value takes effect, and the `rollbackDefaultAdminDelay` escape hatch — is
+     *      unchanged and handled by the parent.
+     * @param newDelay New delay in seconds. Must not exceed {MAX_ADMIN_DELAY}.
+     */
+    function changeDefaultAdminDelay(uint48 newDelay) public virtual override {
+        _checkAdminDelay(newDelay);
+        super.changeDefaultAdminDelay(newDelay);
     }
 
     /**

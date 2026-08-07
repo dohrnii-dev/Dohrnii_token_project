@@ -117,11 +117,13 @@ contract:
   `cancelDefaultAdminTransfer`. With a delay of `0` there is no window at all: the nominee can
   accept in the next block, and only the explicit-acceptance guarantee remains. A non-zero delay is
   what buys time to react to a wrong or compromised nominee — pick it deliberately.
-- **`_initialAdminDelay` is capped at `MAX_ADMIN_DELAY` (7 days).** Reducing a delay later costs
-  exactly the amount removed, so an over-long initial value would lock ownership rotation for that
-  whole period with no way to shorten it; `259200000` (milliseconds by mistake) would mean 8 years.
-  Values above the cap are rejected with `DohrniiAdminDelayTooLong`. `0` is accepted — see above for
-  what it costs.
+- **Every admin delay is capped at `MAX_ADMIN_DELAY` (7 days)** — both `_initialAdminDelay` and any
+  later `changeDefaultAdminDelay`. Reducing a delay costs exactly the amount removed, so an
+  over-long value would lock ownership rotation for that whole period with no way to shorten it;
+  `259200000` (milliseconds by mistake) would mean 8 years. A later increase is not exempt: it takes
+  effect after at most `defaultAdminDelayIncreaseWait()` (5 days) and is just as binding afterwards,
+  so `changeDefaultAdminDelay` is overridden to enforce the same bound. Values above the cap are
+  rejected with `DohrniiAdminDelayTooLong`. `0` is accepted — see above for what it costs.
 
 ### ERC-7201 storage
 

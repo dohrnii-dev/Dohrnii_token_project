@@ -440,21 +440,67 @@ describe("DohrniiToken", () => {
         .withArgs(alice.address);
     });
 
-    it("leaves post-deployment delay changes to OpenZeppelin's own guard", async () => {
+    it("caps post-deployment delay changes at MAX_ADMIN_DELAY", async () => {
       const { token, owner } = await fixture();
+      const cap = await token.MAX_ADMIN_DELAY();
 
-      // Deliberately not capped: unlike the initial value, a change waits before taking effect
-      // and can be undone in that window, so a fat-fingered value here is recoverable.
+      // An uncapped increase becomes effective after defaultAdminDelayIncreaseWait() and then
+      // takes about its own length to unwind, locking admin rotation for years.
       const overLong = 10n ** 12n;
-      await token.connect(owner).changeDefaultAdminDelay(overLong);
+      await expect(token.connect(owner).changeDefaultAdminDelay(overLong))
+        .to.be.revertedWithCustomError(token, "DohrniiAdminDelayTooLong")
+        .withArgs(overLong, cap);
+
+      await expect(token.connect(owner).changeDefaultAdminDelay(cap + 1n))
+        .to.be.revertedWithCustomError(token, "DohrniiAdminDelayTooLong")
+        .withArgs(cap + 1n, cap);
+
+      const [untouched] = await token.pendingDefaultAdminDelay();
+      expect(untouched).to.equal(0n);
+      expect(await token.defaultAdminDelay()).to.equal(ADMIN_DELAY);
+    });
+
+    it("schedules a change at the cap and still allows rolling it back", async () => {
+      const { token, owner } = await fixture();
+      const cap = await token.MAX_ADMIN_DELAY();
+
+      await token.connect(owner).changeDefaultAdminDelay(cap);
       expect(await token.defaultAdminDelay()).to.equal(ADMIN_DELAY);
       const [pendingDelay] = await token.pendingDefaultAdminDelay();
-      expect(pendingDelay).to.equal(overLong);
+      expect(pendingDelay).to.equal(cap);
 
       await token.connect(owner).rollbackDefaultAdminDelay();
       const [afterRollback] = await token.pendingDefaultAdminDelay();
       expect(afterRollback).to.equal(0n);
       expect(await token.defaultAdminDelay()).to.equal(ADMIN_DELAY);
+    });
+
+    it("keeps the cap enforced through the proxy after the delay actually takes effect", async () => {
+      const { token, owner } = await fixture();
+      const { networkHelpers } = await connect();
+      const cap = await token.MAX_ADMIN_DELAY();
+
+      await token.connect(owner).changeDefaultAdminDelay(cap);
+      const [, effectSchedule] = await token.pendingDefaultAdminDelay();
+      await networkHelpers.time.increaseTo(effectSchedule + 1n);
+      expect(await token.defaultAdminDelay()).to.equal(cap);
+
+      // Still bounded once the larger value is live; lowering it back remains permitted.
+      await expect(token.connect(owner).changeDefaultAdminDelay(cap + 1n)).to.be.revertedWithCustomError(
+        token,
+        "DohrniiAdminDelayTooLong",
+      );
+      await token.connect(owner).changeDefaultAdminDelay(ADMIN_DELAY);
+      const [lowered] = await token.pendingDefaultAdminDelay();
+      expect(lowered).to.equal(ADMIN_DELAY);
+    });
+
+    it("still restricts delay changes to the default admin", async () => {
+      const { token, alice } = await fixture();
+      await expect(token.connect(alice).changeDefaultAdminDelay(1n)).to.be.revertedWithCustomError(
+        token,
+        "AccessControlUnauthorizedAccount",
+      );
     });
   });
 

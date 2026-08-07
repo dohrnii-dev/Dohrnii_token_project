@@ -15,7 +15,7 @@ implementation has no state and its `initialize` is permanently disabled.
 | `beginDefaultAdminTransfer(newOwner)` | `DEFAULT_ADMIN_ROLE` | starts ownership transfer |
 | `cancelDefaultAdminTransfer()` | `DEFAULT_ADMIN_ROLE` | aborts it |
 | `acceptDefaultAdminTransfer()` | pending owner, after the delay | completes it |
-| `changeDefaultAdminDelay(uint48)` | `DEFAULT_ADMIN_ROLE` | changes the delay (itself delayed) |
+| `changeDefaultAdminDelay(uint48)` | `DEFAULT_ADMIN_ROLE` | changes the delay (itself delayed); capped at `MAX_ADMIN_DELAY` |
 | `rollbackDefaultAdminDelay()` | `DEFAULT_ADMIN_ROLE` | cancels a delay change that has not taken effect yet |
 | `upgradeToAndCall(impl, data)` | `UPGRADER_ROLE` | points the proxy at new code |
 
