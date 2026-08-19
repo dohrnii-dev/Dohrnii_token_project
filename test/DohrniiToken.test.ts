@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { connect, TOTAL_SUPPLY, ADMIN_DELAY } from "./helpers.js";
+import { connect, TOTAL_SUPPLY, ADMIN_DELAY, ADMIN_ACCEPT_WINDOW } from "./helpers.js";
 
 describe("DohrniiToken", () => {
   async function deployFixture() {
@@ -230,6 +230,89 @@ describe("DohrniiToken", () => {
       await expect(token.connect(alice).approve(bob.address, ethers.parseEther("1"))).to.not.revert(ethers);
     });
 
+    it("blocks a blacklisted spender exercising an allowance", async () => {
+      const { ethers, token, owner, alice, bob, carol } = await fixture();
+      const amount = ethers.parseEther("10");
+      await token.connect(alice).approve(bob.address, amount);
+      await token.connect(owner).setBlacklisted(bob.address, true);
+
+      // Neither balance endpoint is listed: without the spender check this would settle.
+      await expect(token.connect(bob).transferFrom(alice.address, carol.address, amount))
+        .to.be.revertedWithCustomError(token, "DohrniiBlacklistedAddress")
+        .withArgs(bob.address);
+      expect(await token.balanceOf(carol.address)).to.equal(0n);
+      expect(await token.allowance(alice.address, bob.address)).to.equal(amount);
+    });
+
+    it("blocks a blacklisted spender holding an infinite allowance", async () => {
+      const { ethers, token, owner, alice, bob, carol } = await fixture();
+      await token.connect(alice).approve(bob.address, ethers.MaxUint256);
+      await token.connect(owner).setBlacklisted(bob.address, true);
+
+      // The parent `_spendAllowance` skips its whole body on an infinite allowance, so a check
+      // placed after the super call would be bypassed by exactly the most common approval.
+      await expect(token.connect(bob).transferFrom(alice.address, carol.address, ethers.parseEther("10")))
+        .to.be.revertedWithCustomError(token, "DohrniiBlacklistedAddress")
+        .withArgs(bob.address);
+    });
+
+    it("blocks a blacklisted spender contract that holds allowances but no balance", async () => {
+      const { ethers, token, owner, alice, carol } = await fixture();
+      const amount = ethers.parseEther("10");
+
+      const Spender = await ethers.getContractFactory("AllowanceSpenderMock");
+      const spender = await Spender.deploy(await token.getAddress());
+      const spenderAddress = await spender.getAddress();
+
+      await token.connect(alice).approve(spenderAddress, ethers.MaxUint256);
+
+      // Works while the router is clean, and never holds a balance of its own.
+      await spender.connect(carol).pull(alice.address, carol.address, amount);
+      expect(await token.balanceOf(carol.address)).to.equal(amount);
+      expect(await token.balanceOf(spenderAddress)).to.equal(0n);
+
+      // The audited scenario: a compromised router is neither party to the transfer, so listing it
+      // only bites through the spender check.
+      await token.connect(owner).setBlacklisted(spenderAddress, true);
+      await expect(spender.connect(carol).pull(alice.address, carol.address, amount))
+        .to.be.revertedWithCustomError(token, "DohrniiBlacklistedAddress")
+        .withArgs(spenderAddress);
+      expect(await token.balanceOf(carol.address)).to.equal(amount);
+    });
+
+    it("lets a holder revoke an allowance granted to an address blacklisted afterwards", async () => {
+      const { ethers, token, owner, alice, bob } = await fixture();
+      await token.connect(alice).approve(bob.address, ethers.MaxUint256);
+      await token.connect(owner).setBlacklisted(bob.address, true);
+
+      // Deliberately not gated: revoking is the one action an exposed holder needs to take.
+      await expect(token.connect(alice).approve(bob.address, 0n)).to.not.revert(ethers);
+      expect(await token.allowance(alice.address, bob.address)).to.equal(0n);
+      await expect(token.connect(alice).approve(bob.address, 1n)).to.not.revert(ethers);
+    });
+
+    it("un-blacklisting a spender restores its allowance", async () => {
+      const { ethers, token, owner, alice, bob, carol } = await fixture();
+      const amount = ethers.parseEther("10");
+      await token.connect(alice).approve(bob.address, amount);
+      await token.connect(owner).setBlacklisted(bob.address, true);
+      await token.connect(owner).setBlacklisted(bob.address, false);
+
+      await token.connect(bob).transferFrom(alice.address, carol.address, amount);
+      expect(await token.balanceOf(carol.address)).to.equal(amount);
+    });
+
+    it("lets a blacklisted spender through once enforcement is switched off", async () => {
+      const { ethers, token, owner, alice, bob, carol } = await fixture();
+      const amount = ethers.parseEther("10");
+      await token.connect(alice).approve(bob.address, amount);
+      await token.connect(owner).setBlacklisted(bob.address, true);
+
+      await token.connect(owner).setBlacklistEnabled(false);
+      await token.connect(bob).transferFrom(alice.address, carol.address, amount);
+      expect(await token.balanceOf(carol.address)).to.equal(amount);
+    });
+
     it("un-blacklisting restores transfers", async () => {
       const { ethers, token, owner, alice, bob } = await fixture();
       await token.connect(owner).setBlacklisted(alice.address, true);
@@ -428,6 +511,69 @@ describe("DohrniiToken", () => {
       expect(pendingAdmin).to.equal(alice.address);
     });
 
+    it("expires an abandoned nomination after ADMIN_ACCEPT_WINDOW", async () => {
+      const { token, owner, alice } = await fixture();
+      const { networkHelpers } = await connect();
+
+      expect(await token.ADMIN_ACCEPT_WINDOW()).to.equal(ADMIN_ACCEPT_WINDOW);
+      expect(await token.defaultAdminTransferDeadline()).to.equal(0n);
+
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      const [, schedule] = await token.pendingDefaultAdmin();
+      const deadline = schedule + ADMIN_ACCEPT_WINDOW;
+      expect(await token.defaultAdminTransferDeadline()).to.equal(deadline);
+
+      // setNextBlockTimestamp pins the block this transaction lands in, so the boundary is exact.
+      await networkHelpers.time.setNextBlockTimestamp(deadline + 1n);
+      await expect(token.connect(alice).acceptDefaultAdminTransfer())
+        .to.be.revertedWithCustomError(token, "DohrniiAdminTransferExpired")
+        .withArgs(schedule, deadline);
+      expect(await token.owner()).to.equal(owner.address);
+    });
+
+    it("still accepts at exactly the last permitted second", async () => {
+      const { token, owner, alice } = await fixture();
+      const { networkHelpers } = await connect();
+
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      const deadline = await token.defaultAdminTransferDeadline();
+
+      await networkHelpers.time.setNextBlockTimestamp(deadline);
+      await token.connect(alice).acceptDefaultAdminTransfer();
+      expect(await token.owner()).to.equal(alice.address);
+    });
+
+    it("leaves an expired nomination visible, cancellable and renewable", async () => {
+      const { ethers, token, owner, alice } = await fixture();
+      const { networkHelpers } = await connect();
+
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await networkHelpers.time.increaseTo(await token.defaultAdminTransferDeadline());
+
+      // Expiry disarms the claim; it does not clear the record. Clearing it stays an operator step,
+      // which is why the runbook makes cancellation mandatory rather than optional.
+      const [pendingAdmin] = await token.pendingDefaultAdmin();
+      expect(pendingAdmin).to.equal(alice.address);
+
+      await token.connect(owner).cancelDefaultAdminTransfer();
+      expect((await token.pendingDefaultAdmin())[0]).to.equal(ethers.ZeroAddress);
+      expect(await token.defaultAdminTransferDeadline()).to.equal(0n);
+
+      // A nomination that is still wanted after expiry is simply started again.
+      await token.connect(owner).beginDefaultAdminTransfer(alice.address);
+      await networkHelpers.time.increase(ADMIN_DELAY);
+      await token.connect(alice).acceptDefaultAdminTransfer();
+      expect(await token.owner()).to.equal(alice.address);
+    });
+
+    it("leaves the parent's error in place when nothing is pending", async () => {
+      const { token, alice } = await fixture();
+      // The deadline check must not shadow "there is no transfer to accept".
+      await expect(token.connect(alice).acceptDefaultAdminTransfer())
+        .to.be.revertedWithCustomError(token, "AccessControlInvalidDefaultAdmin")
+        .withArgs(alice.address);
+    });
+
     it("re-nominating replaces the candidate and restarts the window", async () => {
       const { token, owner, alice, bob } = await fixture();
       await token.connect(owner).beginDefaultAdminTransfer(alice.address);
@@ -501,6 +647,95 @@ describe("DohrniiToken", () => {
         token,
         "AccessControlUnauthorizedAccount",
       );
+    });
+  });
+
+  describe("renouncing roles", () => {
+    it("lets a role holder drop its own role", async () => {
+      const { token, owner } = await fixture();
+      const role = await token.BLACKLIST_MANAGER_ROLE();
+
+      await expect(token.connect(owner).renounceRole(role, owner.address))
+        .to.emit(token, "RoleRevoked")
+        .withArgs(role, owner.address, owner.address);
+      expect(await token.hasRole(role, owner.address)).to.equal(false);
+    });
+
+    it("refuses to renounce on someone else's behalf", async () => {
+      const { token, owner, alice } = await fixture();
+      const role = await token.BLACKLIST_MANAGER_ROLE();
+
+      await expect(
+        token.connect(alice).renounceRole(role, owner.address),
+      ).to.be.revertedWithCustomError(token, "AccessControlBadConfirmation");
+      expect(await token.hasRole(role, owner.address)).to.equal(true);
+    });
+
+    it("is a no-op for a role the caller does not hold", async () => {
+      const { ethers, token, alice } = await fixture();
+      const role = await token.BLACKLIST_MANAGER_ROLE();
+
+      await expect(token.connect(alice).renounceRole(role, alice.address)).to.not.emit(
+        token,
+        "RoleRevoked",
+      );
+      expect(ethers.isAddress(alice.address)).to.equal(true);
+    });
+
+    it("refuses a direct renouncement of the default admin role", async () => {
+      const { token, owner } = await fixture();
+      // Renouncing ownership goes through the same delayed two-step flow as transferring it,
+      // with the zero address as the nominee.
+      await expect(
+        token.connect(owner).renounceRole(await token.DEFAULT_ADMIN_ROLE(), owner.address),
+      ).to.be.revertedWithCustomError(token, "AccessControlEnforcedDefaultAdminDelay");
+      expect(await token.owner()).to.equal(owner.address);
+    });
+
+    it("renounces the default admin role through a transfer to the zero address", async () => {
+      const { ethers, token, owner } = await fixture();
+      const { networkHelpers } = await connect();
+      const adminRole = await token.DEFAULT_ADMIN_ROLE();
+
+      await token.connect(owner).beginDefaultAdminTransfer(ethers.ZeroAddress);
+      await expect(
+        token.connect(owner).renounceRole(adminRole, owner.address),
+      ).to.be.revertedWithCustomError(token, "AccessControlEnforcedDefaultAdminDelay");
+
+      // Deliberately not bounded by ADMIN_ACCEPT_WINDOW: only the admin itself can exercise this
+      // schedule, so an unused one is not a claim anybody else could take up.
+      await networkHelpers.time.increase(ADMIN_DELAY + ADMIN_ACCEPT_WINDOW * 2n);
+      await token.connect(owner).renounceRole(adminRole, owner.address);
+
+      expect(await token.owner()).to.equal(ethers.ZeroAddress);
+      expect(await token.hasRole(adminRole, owner.address)).to.equal(false);
+      // The operational roles are untouched, and nothing can grant them again.
+      expect(await token.hasRole(await token.BLACKLIST_MANAGER_ROLE(), owner.address)).to.equal(true);
+    });
+  });
+
+  describe("ERC-165", () => {
+    it("advertises the interfaces it registers, and nothing else", async () => {
+      const { token } = await fixture();
+
+      // Each id is the XOR of the selectors that interface declares itself; inherited functions
+      // are excluded, per Solidity's `type(I).interfaceId`.
+      expect(await token.supportsInterface("0x01ffc9a7")).to.equal(true); // IERC165
+      expect(await token.supportsInterface("0x7965db0b")).to.equal(true); // IAccessControl
+      expect(await token.supportsInterface("0x31498786")).to.equal(true); // …DefaultAdminRules
+
+      expect(await token.supportsInterface("0xffffffff")).to.equal(false);
+      expect(await token.supportsInterface("0xdeadbeef")).to.equal(false);
+    });
+
+    it("does not advertise ERC-20 or ERC-5313, which it implements without registering", async () => {
+      const { token } = await fixture();
+
+      // Upstream OpenZeppelin behaviour, kept as is: `owner()` and the ERC-20 surface are present
+      // and callable, but neither is registered for ERC-165 detection. Recorded so a future change
+      // in either direction is a deliberate one.
+      expect(await token.supportsInterface("0x36372b07")).to.equal(false); // IERC20
+      expect(await token.supportsInterface("0x8da5cb5b")).to.equal(false); // IERC5313
     });
   });
 

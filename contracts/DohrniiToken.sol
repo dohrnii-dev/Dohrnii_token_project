@@ -15,14 +15,20 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
  * - Fixed supply: {TOTAL_SUPPLY} DHN is minted once, during {initialize}, to the nominated
  *   supply recipient. There is no mint function and none can be reached by any role.
  * - Blacklist: the only transfer restriction in this build. A blacklisted address can neither
- *   send nor receive DHN. {FEATURE_MANAGER_ROLE} can switch the whole check off without
- *   clearing the list.
+ *   send nor receive DHN, nor spend an allowance another account granted it.
+ *   {FEATURE_MANAGER_ROLE} can switch the whole check off without clearing the list.
  * - Storage: all state introduced by this contract lives in a single ERC-7201 namespaced
  *   struct, so a future upgrade can add its own namespace without any storage-layout
  *   migration on the live token.
  * - Access control: {AccessControlDefaultAdminRulesUpgradeable} gives a single owner wallet
  *   (the default admin, also exposed as {owner} per ERC-5313) plus two-step, time-delayed
  *   transfer of that admin — the Ownable2Step guarantee — while still allowing granular roles.
+ *   That transfer also expires: see {ADMIN_ACCEPT_WINDOW}.
+ * - Upgrades: {UPGRADER_ROLE} can replace the implementation, but only through the same shape of
+ *   flow — {scheduleUpgrade} commits to an implementation and its call data, {upgradeToAndCall}
+ *   executes it once {UPGRADE_DELAY} has passed and before {UPGRADE_WINDOW} closes. The pending
+ *   code is therefore public before it can take effect, and either the role holder or the default
+ *   admin can cancel it in the meantime.
  */
 contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgradeable, UUPSUpgradeable {
     // -------------------------------------------------------------------------
@@ -57,16 +63,51 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
      */
     uint48 public constant MAX_ADMIN_DELAY = 7 days;
 
+    /**
+     * @notice How long a scheduled ownership transfer stays claimable once its delay has elapsed.
+     * @dev The base contract puts no deadline on acceptance, so a nomination that is abandoned
+     *      rather than cancelled leaves a claim on {DEFAULT_ADMIN_ROLE} that can be exercised
+     *      years later. Bounding the window lets an abandoned nomination expire on its own; one
+     *      that is still wanted is renewed with another `beginDefaultAdminTransfer`.
+     */
+    uint48 public constant ADMIN_ACCEPT_WINDOW = 30 days;
+
+    /**
+     * @notice Delay between committing to an upgrade and being able to execute it.
+     * @dev {UPGRADER_ROLE} can replace the whole implementation and is therefore at least as
+     *      powerful as the default admin, which moves only through a delayed two-step transfer.
+     *      The delay puts the pending implementation and its call data on chain ahead of time, so
+     *      holders can exit and the default admin can revoke the role or cancel the commitment
+     *      before it takes effect. It is deliberately short: the immediate levers in an incident
+     *      are {setBlacklisted} and {setBlacklistEnabled}, never an upgrade.
+     */
+    uint48 public constant UPGRADE_DELAY = 1 days;
+
+    /**
+     * @notice How long a scheduled upgrade stays executable once {UPGRADE_DELAY} has elapsed.
+     * @dev Same reasoning as {ADMIN_ACCEPT_WINDOW}: a commitment nobody executes expires instead
+     *      of staying live indefinitely.
+     */
+    uint48 public constant UPGRADE_WINDOW = 30 days;
+
     // -------------------------------------------------------------------------
     // ERC-7201 namespaced storage
     // -------------------------------------------------------------------------
 
     /// @custom:storage-location erc7201:dohrnii.storage.DohrniiToken
     struct DohrniiTokenStorage {
+        // Slot 0: the flag read on every transfer, packed with the two upgrade fields that are
+        // only touched by {scheduleUpgrade}. Slot 1: the blacklist mapping. Slot 2: the call hash.
         /// @dev Whether the blacklist is enforced on transfers.
         bool blacklistEnabled;
+        /// @dev Implementation committed to by {scheduleUpgrade}. Zero when nothing is scheduled.
+        address pendingImplementation;
+        /// @dev Timestamp from which the scheduled upgrade may be executed. Zero when none is.
+        uint48 upgradeSchedule;
         /// @dev Blacklisted addresses.
         mapping(address account => bool blacklisted) blacklist;
+        /// @dev keccak256 of the `data` the scheduled upgrade must be executed with.
+        bytes32 pendingUpgradeCallHash;
     }
 
     // keccak256(abi.encode(uint256(keccak256("dohrnii.storage.DohrniiToken")) - 1)) & ~bytes32(uint256(0xff))
@@ -97,6 +138,23 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
      */
     event BlacklistEnabledUpdated(bool enabled);
 
+    /**
+     * @notice Emitted when an upgrade is committed to, replacing any earlier commitment.
+     * @param implementation The implementation the upgrade is committed to.
+     * @param callDataHash keccak256 of the `data` the upgrade must be executed with.
+     * @param executableAt Timestamp from which the upgrade may be executed.
+     * @param expiresAt Timestamp after which the commitment can no longer be executed.
+     */
+    event UpgradeScheduled(
+        address indexed implementation, bytes32 callDataHash, uint48 executableAt, uint48 expiresAt
+    );
+
+    /**
+     * @notice Emitted when a scheduled upgrade is cancelled before execution.
+     * @param implementation The implementation that had been committed to.
+     */
+    event UpgradeCancelled(address indexed implementation);
+
     // -------------------------------------------------------------------------
     // Errors
     // -------------------------------------------------------------------------
@@ -109,6 +167,21 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
 
     /// @dev The requested ownership-transfer delay exceeds {MAX_ADMIN_DELAY}.
     error DohrniiAdminDelayTooLong(uint48 delay, uint48 maxDelay);
+
+    /// @dev The pending ownership transfer is past its {ADMIN_ACCEPT_WINDOW} deadline.
+    error DohrniiAdminTransferExpired(uint48 schedule, uint48 deadline);
+
+    /// @dev No upgrade is currently scheduled.
+    error DohrniiNoScheduledUpgrade();
+
+    /// @dev The implementation and call data do not match the scheduled commitment.
+    error DohrniiUpgradeNotScheduled(address implementation, bytes32 callDataHash);
+
+    /// @dev The scheduled upgrade cannot be executed until {UPGRADE_DELAY} has elapsed.
+    error DohrniiUpgradeNotReady(uint48 executableAt);
+
+    /// @dev The scheduled upgrade is past its {UPGRADE_WINDOW} deadline.
+    error DohrniiUpgradeExpired(uint48 expiresAt);
 
     // -------------------------------------------------------------------------
     // Construction
@@ -168,6 +241,39 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         return _getDohrniiTokenStorage().blacklistEnabled;
     }
 
+    /**
+     * @notice The upgrade currently committed to, if any.
+     * @return implementation Committed implementation. Zero when nothing is scheduled.
+     * @return callDataHash keccak256 of the `data` the upgrade must be executed with.
+     * @return executableAt Timestamp from which it may be executed.
+     * @return expiresAt Timestamp after which it can no longer be executed.
+     */
+    function pendingUpgrade()
+        public
+        view
+        returns (address implementation, bytes32 callDataHash, uint48 executableAt, uint48 expiresAt)
+    {
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+        executableAt = $.upgradeSchedule;
+
+        return (
+            $.pendingImplementation,
+            $.pendingUpgradeCallHash,
+            executableAt,
+            executableAt == 0 ? 0 : executableAt + UPGRADE_WINDOW
+        );
+    }
+
+    /**
+     * @notice Last timestamp at which a pending ownership transfer can still be accepted.
+     * @return deadline The deadline, or zero when no transfer is pending.
+     */
+    function defaultAdminTransferDeadline() public view returns (uint48 deadline) {
+        (, uint48 schedule) = pendingDefaultAdmin();
+
+        return schedule == 0 ? 0 : schedule + ADMIN_ACCEPT_WINDOW;
+    }
+
     // -------------------------------------------------------------------------
     // Administration
     // -------------------------------------------------------------------------
@@ -223,6 +329,112 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         }
     }
 
+    /**
+     * @notice Accepts a pending ownership transfer, within {ADMIN_ACCEPT_WINDOW} of its schedule.
+     * @dev Adds the deadline the base contract does not apply. Without it an abandoned nomination
+     *      leaves a claim on {DEFAULT_ADMIN_ROLE} that stays exercisable for as long as nobody
+     *      cancels it. Everything else — who may call, and the delay before acceptance opens — is
+     *      unchanged and handled by the parent.
+     *
+     *      An expired nomination stays visible in `pendingDefaultAdmin()` until it is cancelled or
+     *      replaced; it simply can no longer be accepted. A nomination that is still wanted after
+     *      expiry is renewed by calling `beginDefaultAdminTransfer` again.
+     */
+    function acceptDefaultAdminTransfer() public virtual override {
+        (, uint48 schedule) = pendingDefaultAdmin();
+
+        // schedule == 0 means nothing is pending, which is the parent's error to raise, not ours.
+        if (schedule != 0) {
+            uint48 deadline = schedule + ADMIN_ACCEPT_WINDOW;
+            if (block.timestamp > deadline) revert DohrniiAdminTransferExpired(schedule, deadline);
+        }
+
+        super.acceptDefaultAdminTransfer();
+    }
+
+    /**
+     * @notice Commits to an upgrade, executable after {UPGRADE_DELAY} and before
+     *         {UPGRADE_WINDOW} closes. Replaces any earlier commitment.
+     * @dev The call data is committed to by hash, so a `reinitializer` and its arguments are fixed
+     *      at scheduling time rather than chosen at execution: the delay would otherwise only
+     *      cover which code runs, not what it is told to do.
+     * @param newImplementation Implementation to upgrade to. Must not be the zero address.
+     * @param data Call data to run on the new implementation, empty for none. Whatever is passed
+     *        to {upgradeToAndCall} must hash to the same value.
+     */
+    function scheduleUpgrade(address newImplementation, bytes calldata data) external onlyRole(UPGRADER_ROLE) {
+        if (newImplementation == address(0)) revert DohrniiZeroAddress();
+
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+        uint48 executableAt = uint48(block.timestamp) + UPGRADE_DELAY;
+        bytes32 callDataHash = keccak256(data);
+
+        $.pendingImplementation = newImplementation;
+        $.pendingUpgradeCallHash = callDataHash;
+        $.upgradeSchedule = executableAt;
+
+        emit UpgradeScheduled(newImplementation, callDataHash, executableAt, executableAt + UPGRADE_WINDOW);
+    }
+
+    /**
+     * @notice Cancels the scheduled upgrade.
+     * @dev Open to {UPGRADER_ROLE} and to the default admin: the delay is only worth something if
+     *      ownership can veto an upgrade it does not want while the delay is running. The revert
+     *      names {UPGRADER_ROLE} for an unauthorised caller, as the role the call is about.
+     */
+    function cancelScheduledUpgrade() external {
+        if (!hasRole(UPGRADER_ROLE, _msgSender()) && !hasRole(DEFAULT_ADMIN_ROLE, _msgSender())) {
+            revert AccessControlUnauthorizedAccount(_msgSender(), UPGRADER_ROLE);
+        }
+
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+        address implementation = $.pendingImplementation;
+        if (implementation == address(0)) revert DohrniiNoScheduledUpgrade();
+
+        _clearScheduledUpgrade();
+
+        emit UpgradeCancelled(implementation);
+    }
+
+    /**
+     * @notice Upgrades the proxy to the implementation committed to by {scheduleUpgrade}.
+     * @dev The role check runs first so an unauthorised caller always gets
+     *      `AccessControlUnauthorizedAccount` rather than a complaint about the commitment, and
+     *      `onlyProxy` is restated so a direct call on the implementation still fails on that
+     *      before any storage is read. The commitment is cleared before control passes to the new
+     *      implementation, so nothing in this namespace is written after that point.
+     * @param newImplementation Must equal the scheduled implementation.
+     * @param data Must hash to the scheduled call data.
+     */
+    function upgradeToAndCall(address newImplementation, bytes memory data)
+        public
+        payable
+        virtual
+        override
+        onlyProxy
+    {
+        _checkRole(UPGRADER_ROLE);
+
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+
+        uint48 executableAt = $.upgradeSchedule;
+        if (executableAt == 0) revert DohrniiNoScheduledUpgrade();
+
+        bytes32 callDataHash = keccak256(data);
+        if (newImplementation != $.pendingImplementation || callDataHash != $.pendingUpgradeCallHash) {
+            revert DohrniiUpgradeNotScheduled(newImplementation, callDataHash);
+        }
+
+        if (block.timestamp < executableAt) revert DohrniiUpgradeNotReady(executableAt);
+
+        uint48 expiresAt = executableAt + UPGRADE_WINDOW;
+        if (block.timestamp > expiresAt) revert DohrniiUpgradeExpired(expiresAt);
+
+        _clearScheduledUpgrade();
+
+        super.upgradeToAndCall(newImplementation, data);
+    }
+
     // -------------------------------------------------------------------------
     // Internals
     // -------------------------------------------------------------------------
@@ -237,6 +449,24 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         }
 
         super._update(from, to, value);
+    }
+
+    /**
+     * @dev Rejects an allowance spend by a blacklisted spender. Only reached from `transferFrom`,
+     *      so a plain `transfer` is still governed by {_update} alone.
+     *
+     *      Two deliberate details. The check sits before the parent call because the parent
+     *      short-circuits on an infinite allowance, and a check placed after it would be skipped
+     *      by every `approve(spender, type(uint256).max)`. And `_approve` is left unguarded, so a
+     *      holder can always revoke an allowance it granted to an address that was blacklisted
+     *      afterwards — the one action such a holder needs to be able to take.
+     */
+    function _spendAllowance(address holder, address spender, uint256 value) internal virtual override {
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+
+        if ($.blacklistEnabled && $.blacklist[spender]) revert DohrniiBlacklistedAddress(spender);
+
+        super._spendAllowance(holder, spender, value);
     }
 
     /// @dev Rejects an ownership-transfer delay that could not be undone in reasonable time.
@@ -254,7 +484,17 @@ contract DohrniiToken is ERC20Upgradeable, AccessControlDefaultAdminRulesUpgrade
         }
     }
 
-    /// @dev Only {UPGRADER_ROLE} may point the proxy at a new implementation.
+    /// @notice Clears the pending upgrade commitment.
+    function _clearScheduledUpgrade() private {
+        DohrniiTokenStorage storage $ = _getDohrniiTokenStorage();
+
+        delete $.pendingImplementation;
+        delete $.upgradeSchedule;
+        delete $.pendingUpgradeCallHash;
+    }
+
+    /// @dev Only {UPGRADER_ROLE} may point the proxy at a new implementation. Timing and the
+    ///      commitment itself are enforced in {upgradeToAndCall}, the only path that reaches here.
     // solhint-disable-next-line no-empty-blocks
     function _authorizeUpgrade(address) internal virtual override onlyRole(UPGRADER_ROLE) {}
 }

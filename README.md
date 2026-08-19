@@ -39,20 +39,32 @@ logic — is meant to hold on its own merits. A finding there is a real finding.
 
 | Feature | State at launch | Control |
 |---|---|---|
-| Blacklist (freeze addresses) | Active, blocks sending and receiving | `BLACKLIST_MANAGER_ROLE` / `FEATURE_MANAGER_ROLE` |
-| UUPS upgradeability | Active | `UPGRADER_ROLE` |
+| Blacklist (freeze addresses) | Active, blocks sending, receiving and spending allowances | `BLACKLIST_MANAGER_ROLE` / `FEATURE_MANAGER_ROLE` |
+| UUPS upgradeability | Active, two-step with a 1-day delay | `UPGRADER_ROLE` |
 | Fixed supply, no mint | Active | — (not changeable) |
 | ERC-7201 namespaced storage | Active | — |
 | Tax / burn / pause | Deferred by design | added later by upgrade |
 
 ### Blacklist
 
-A blacklisted address can neither send nor receive DHN: `_update` rejects the transfer if either
-party is on the list. `isBlacklisted(account)` reads the list; `setBlacklisted` /
-`setBlacklistedBatch` maintain it.
+A blacklisted address can neither send nor receive DHN, nor spend an allowance someone granted it:
+`_update` rejects the transfer if either party is on the list, and `_spendAllowance` rejects it if
+the spender is. `isBlacklisted(account)` reads the list; `setBlacklisted` / `setBlacklistedBatch`
+maintain it.
 
-Approvals are never blocked; only balance movements are, so a blacklisted holder can still sign an
-`approve` but no transfer will settle.
+The spender check is what makes the list useful against a compromised integration. A contract that
+holds allowances but no balance — a router, a bridge, `Permit2` — is neither `from` nor `to`, so
+without it, listing such a contract would not stop it draining every account that had approved it,
+and the alternatives are impracticable: blacklisting the receivers requires seeing the transaction
+before it lands, which a private mempool prevents, and blacklisting the victims can exceed the block
+gas limit while also punishing the wrong party. The consequence to hold in mind is that listing a
+shared piece of infrastructure now stops it for **every** holder, so [docs/RUNBOOK.md](docs/RUNBOOK.md)
+makes checking for that a step rather than a footnote.
+
+Approvals themselves are never blocked. `approve` stays open in both directions — a blacklisted
+holder can still sign one, and a holder can still set an allowance to a blacklisted spender. That is
+deliberate: gating `approve` would stop an exposed holder from calling `approve(spender, 0)`, which
+is exactly the action such a holder needs to take. Nothing settles either way while the list bites.
 
 `blacklistEnabled()` is the kill switch: `FEATURE_MANAGER_ROLE` can call
 `setBlacklistEnabled(false)` to stop all enforcement without clearing the list, and switch it back
@@ -98,7 +110,7 @@ fill.
 | `DEFAULT_ADMIN_ROLE` | grant/revoke every other role; reported as `owner()` (ERC-5313) |
 | `BLACKLIST_MANAGER_ROLE` | `setBlacklisted`, `setBlacklistedBatch` |
 | `FEATURE_MANAGER_ROLE` | `setBlacklistEnabled` |
-| `UPGRADER_ROLE` | `upgradeToAndCall` |
+| `UPGRADER_ROLE` | `scheduleUpgrade`, `upgradeToAndCall`, `cancelScheduledUpgrade` |
 
 `initialize` grants all four to the owner wallet, so the single wallet you control operates the
 token out of the box and can delegate any individual power later without giving up ownership.
@@ -109,14 +121,23 @@ Ownership itself moves in two steps (`AccessControlDefaultAdminRules`): the curr
 or unreachable address in a single transaction — the Ownable2Step guarantee, with granular roles on
 top.
 
-Two things are worth stating precisely, because they depend on configuration rather than on the
-contract:
+Three things are worth stating precisely, because they depend on configuration or on behaviour the
+base contract does not provide:
 
 - **The cancellation window is exactly `defaultAdminDelay()`, whatever was set at deployment.** For
   its duration `acceptDefaultAdminTransfer` reverts and the current owner can call
   `cancelDefaultAdminTransfer`. With a delay of `0` there is no window at all: the nominee can
   accept in the next block, and only the explicit-acceptance guarantee remains. A non-zero delay is
   what buys time to react to a wrong or compromised nominee — pick it deliberately.
+- **A nomination expires `ADMIN_ACCEPT_WINDOW` (30 days) after it becomes acceptable.** The base
+  contract puts no deadline on acceptance, so a nomination left un-cancelled stays a live claim on
+  `DEFAULT_ADMIN_ROLE` indefinitely — someone who was nominated and forgotten about could accept a
+  year later. `acceptDefaultAdminTransfer` is overridden to reject acceptance past
+  `defaultAdminTransferDeadline()`, with `DohrniiAdminTransferExpired`. Expiry disarms the claim but
+  does not clear the record: the entry stays visible in `pendingDefaultAdmin()` until it is
+  cancelled or replaced, and a nomination that is still wanted is simply started again. Renouncing
+  ownership (a transfer to the zero address, then `renounceRole`) is deliberately *not* bounded by
+  this window, since only the admin itself can exercise that schedule.
 - **Every admin delay is capped at `MAX_ADMIN_DELAY` (7 days)** — both `_initialAdminDelay` and any
   later `changeDefaultAdminDelay`. Reducing a delay costs exactly the amount removed, so an
   over-long value would lock ownership rotation for that whole period with no way to shorten it;
@@ -124,6 +145,36 @@ contract:
   effect after at most `defaultAdminDelayIncreaseWait()` (5 days) and is just as binding afterwards,
   so `changeDefaultAdminDelay` is overridden to enforce the same bound. Values above the cap are
   rejected with `DohrniiAdminDelayTooLong`. `0` is accepted — see above for what it costs.
+
+### Upgrade delay
+
+`UPGRADER_ROLE` can replace the implementation with anything, which makes it at least as powerful as
+`DEFAULT_ADMIN_ROLE` — and the admin role only moves through a delayed, two-step transfer. Upgrades
+therefore follow the same shape:
+
+1. `scheduleUpgrade(newImplementation, data)` commits to an implementation **and** to
+   `keccak256(data)`, so the migration call is fixed at scheduling time rather than chosen at
+   execution. `pendingUpgrade()` reports the commitment and its window; `UpgradeScheduled` announces
+   it. Scheduling again replaces an earlier commitment.
+2. After `UPGRADE_DELAY` (1 day) and before `UPGRADE_WINDOW` (30 days) closes,
+   `upgradeToAndCall(newImplementation, data)` executes exactly what was committed to and consumes
+   the commitment, so the same upgrade cannot be replayed.
+3. `cancelScheduledUpgrade()` aborts it. Open to `UPGRADER_ROLE` **and** to the default admin — a
+   delay ownership cannot act on would be decoration.
+
+**Why 24 hours.** The delay is a notice period, not a governance timelock. It has to be long enough
+that a scheduled upgrade is visible before it can take effect — the implementation is deployed and
+verified at scheduling time, so anyone can read the code that is coming, and both the default admin
+and the role holder can cancel within the window. It also has to be short enough not to become the
+reason an incident is handled badly: the immediate levers are `setBlacklisted` /
+`setBlacklistedBatch` and `setBlacklistEnabled`, which stay instant, and an upgrade is never the fast
+path. A day satisfies both; a week would only widen the gap between noticing a problem and being able
+to ship code for it.
+
+**Why granting the role stays immediate.** A newly granted `UPGRADER_ROLE` still cannot act for 24
+hours, and whatever it schedules is public for that whole period, so the protection lives in the
+delay rather than in how the role is handed over. Wrapping `grantRole` in its own two-step flow would
+add moving parts without changing what an attacker holding the admin key could ultimately do.
 
 ### ERC-7201 storage
 
@@ -144,7 +195,7 @@ that adds a V2 namespace.
 npm ci
 cp .env.example .env    # fill in RPC URLs, keys and addresses
 npm run build           # compile
-npm test                # 34 unit tests
+npm test                # 85 unit tests
 npm run coverage        # tests + coverage report (coverage/html)
 npm run lint            # solhint, zero warnings tolerated
 npm run typecheck       # tsc --noEmit
@@ -174,14 +225,20 @@ upgrade plugin needs it to validate storage-layout compatibility later.
 ## Upgrades
 
 ```bash
+# step 1 — validate the layout, deploy the implementation, commit to it
 PROXY_ADDRESS=0x… NEW_IMPLEMENTATION_CONTRACT=DohrniiTokenV2 \
   npx hardhat run scripts/upgrade.ts --network mainnet
+
+# step 2 — after UPGRADE_DELAY, execute the commitment
+PROXY_ADDRESS=0x… EXECUTE=true npx hardhat run scripts/upgrade.ts --network mainnet
 ```
 
-The script validates the new layout against the deployed one before sending anything on chain.
-With `PREPARE_ONLY=true` it deploys and validates the implementation and prints the
-`upgradeToAndCall` call for the upgrader wallet to execute — the mode to use when a multisig or
-hardware wallet holds `UPGRADER_ROLE`.
+Step 1 refuses to send anything if the new layout is incompatible with the deployed one, and
+verifies the implementation on Etherscan immediately, so its sources are public for the whole delay.
+Pass `UPGRADE_CALLDATA=0x…` when the V2 needs a `reinitializer`; it must be byte-identical in both
+steps, since the commitment covers its hash. With `PREPARE_ONLY=true` the script deploys and
+validates the implementation and prints both calls for the upgrader wallet to execute — the mode to
+use when a multisig or hardware wallet holds `UPGRADER_ROLE`.
 
 Rules for a future V2:
 
@@ -190,7 +247,9 @@ Rules for a future V2:
    never deleted — keep every past struct declared, even if a version stops using it.
 2. Add new state through a `reinitializer(n)` function; do not re-run parent initialisers.
 3. Gate any new behaviour behind its own flag and role, so it can be switched off without an upgrade.
-4. Keep `_authorizeUpgrade` gated by `UPGRADER_ROLE`, or the token loses upgradeability.
+4. Keep `_authorizeUpgrade` gated by `UPGRADER_ROLE`, or the token loses upgradeability, and keep
+   the `scheduleUpgrade` commitment enforced in `upgradeToAndCall` — a V2 that reaches
+   `_authorizeUpgrade` by any other path silently removes the upgrade delay.
 5. Each upgrade is new code: fresh tests, fresh review, re-verification on Etherscan.
 
 If a transfer tax is ever added, note that it only works with Uniswap-V2-style pools;
